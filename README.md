@@ -1,62 +1,113 @@
-# UCMEC-mmWave-Fronthaul
-Evaluation code of our paper in IEEE Transactions on Mobile Computing: ''Towards Decentralized Task Offloading and Resource Allocation in User-Centric MEC''. This is the extended version of our previous paper ``When the User-Centric Network Meets Mobile Edge Computing: Challenges and Optimization''.
+# UCMEC-mmWave-Fronthaul: Multi-Objective Optimization Platform
 
-Abstract: In the traditional cellular-based mobile edge computing (MEC), users at the edge of the cell are prone to suffer severe inter-cell interference and signal attenuation, leading to low throughput even transmission interruptions. Such edge effect severely obstructs offloading of tasks to MEC servers. To address this issue, we propose user-centric mobile edge computing (UCMEC), a novel MEC architecture integrating user-centric transmission, which can ensure high throughput and reliable communication for task offloading. Then, we formulate an long-term delay minimization problem by jointly optimizing task offloading, power allocation, and computing resource allocation in UCMEC. To solve the intractable problem, we propose two decentralized joint optimization schemes based on multi-agent deep reinforcement learning (MADRL) and convex optimization, which consider both cooperation and non-cooperation among network nodes. Simulation results demonstrate that the proposed schemes in UCMEC can significantly improve the uplink transmission rate by at least 176.99% and reduce the long-term average total delay by at least 16.36% compared to traditional cellular-based MEC.
+> **Upstream Attribution**: Based on research by [qlt315/UCMEC-mmWave-Fronthaul](https://github.com/qlt315/UCMEC-mmWave-Fronthaul) published in *IEEE Transactions on Mobile Computing*: *"Towards Decentralized Task Offloading and Resource Allocation in User-Centric MEC"*.
 
+This repository extends the original UCMEC simulator into a full-stack **Multi-Objective Optimization (MOO)** platform optimizing:
+1. **Execution Delay** ($ms$)
+2. **Device Energy Consumption** ($mJ$)
+3. **Communication Overhead** ($kB$)
+4. **Network Task Reliability** (Success rate $\%$ under deadlines and channel outages)
 
-We have designed a large number of portable multi-agent deep reinforcement learning (MADRL) environments of UCMEC to verify different algorithms. Specifically, IPPO and MAPPO algorithms are modified based on [light-mappo](https://github.com/tinyzqh/light_mappo). Other MADRL algorithms like IQL and MADDPG are simulated based on [epymarl](https://github.com/uoe-agents/epymarl). Thanks very much for the contributions of the authors of these repositories. Please visit the homepages of these repositories to view specific usage tutorials.
+It includes a conic interior-point optimization engine (CLARABEL), durable asynchronous experiment runner, structured SQLite metadata store, FastAPI backend, and an interactive React/TypeScript research dashboard.
 
-## Installation
+---
 
-Simply download the code, create a Conda environment, and then run the code, adding packages as needed.
+## 1. Quick Start (Windows / PowerShell)
 
-##  How to use
+### Prerequisites
+- Conda environment named `ucmec` (Python 3.10)
+- Node.js (v20+ or v22+) & npm
 
-You can quickly design your multi-agent environment using the following template. Please refer to /envs/env_core.py file.
-
-```python
-import numpy as np
-class EnvCore(object):
-    """
-    # Environment Agent
-    """
-    def __init__(self):
-        self.agent_num = 2 # set the number of agents(aircrafts), here set to two
-        self.obs_dim = 14 # set the observation dimension of agents
-        self.action_dim = 5 # set the action dimension of agents, here set to a five-dimensional
-
-    def reset(self):
-        """
-        # When self.agent_num is set to 2 agents, the return value is a list, and each list contains observation data of shape = (self.obs_dim,)
-        """
-        sub_agent_obs = []
-        for i in range(self.agent_num):
-            sub_obs = np.random.random(size=(14, ))
-            sub_agent_obs.append(sub_obs)
-        return sub_agent_obs
-
-    def step(self, actions):
-        """
-        # When self.agent_num is set to 2 agents, the input of actions is a two-dimensional list, and each list contains action data of shape = (self.action_dim,).
-        # By default, the input is a list containing two elements, because the action dimension is 5, so each element has a shape of (5,)
-        """
-        sub_agent_obs = []
-        sub_agent_reward = []
-        sub_agent_done = []
-        sub_agent_info = []
-        for i in range(self.agent_num):
-            sub_agent_obs.append(np.random.random(size=(14,)))
-            sub_agent_reward.append([np.random.rand()])
-            sub_agent_done.append(False)
-            sub_agent_info.append({})
-
-        return [sub_agent_obs, sub_agent_reward, sub_agent_done, sub_agent_info]
+### Activating the Environment & Verifying Dependencies
+```powershell
+# Verify packages in the ucmec environment
+conda run -n ucmec python -c "import torch, cvxpy, clarabel, fastapi; print('Dependencies verified successfully')"
 ```
 
-Just write this part of the code, and you can seamlessly connect with MAPPO. After env_core.py, two files, env_discrete.py and env_continuous.py, were separately extracted to encapsulate the action space and discrete action space. In elif self.continuous_action: in algorithms/utils/act.py, this judgment logic is also used to handle continuous action spaces. The # TODO here in runner/shared/env_runner.py is also used to handle continuous action spaces.
+### Running Unit Tests
+```powershell
+# Run the complete test suite (21 automated unit and integration tests)
+conda run -n ucmec pytest tests -v
+```
 
-In the train.py file, choose to comment out continuous environment or discrete environment to switch the demo environment.
+### Running a Training Smoke Run
+```powershell
+# Train with the balanced multi-objective preset (400 steps, 10 agents)
+conda run -n ucmec python train/train.py --algorithm_name mappo --num_agents 10 --num_env_steps 400 --episode_length 200 --n_rollout_threads 1 --n_training_threads 1 --experiment_name smoke_moo_balanced --moo_preset balanced --log_interval 1 --share_policy --use_centralized_V --cuda
+```
 
-Note: If you want to change the user / AP number in the env files, please change the varaibles "N_sim" and "M_sim", and ensure "N" >= "N_sim" and "M >= M_sim". Also, please modify the "--num_agents" variable in train.py accordingly.
+> **Important Flag Semantics Note**: In this repository, flags such as `--cuda`, `--share_policy`, and `--use_centralized_V` use `store_false` semantics with `default=True`. Passing `--cuda` sets `cuda=False` (forcing CPU execution). Passing `--share_policy` and `--use_centralized_V` configures independent decentralized training (IPPO).
 
+---
 
+## 2. CLI Policy Evaluation & Pareto Frontier Analysis
+
+Evaluate policies deterministically across independent seeds on fixed held-out scenarios:
+
+```powershell
+# Fast multi-preset evaluation
+conda run -n ucmec python evaluate.py --presets legacy delay_only balanced energy_priority reliability_priority --seeds 42 43 44 --num_steps 200
+```
+
+Evaluation outputs are aggregated at the independent seed level ($\mu \pm \sigma$) and saved to `experiments_storage/evaluations/evaluation_summary.json` and `.csv`.
+
+---
+
+## 3. Launching the Backend API & Frontend Dashboard
+
+### Starting the FastAPI Server (Port 8000)
+The backend hosts the REST API, serves the built React frontend, and manages background experiment subprocesses:
+```powershell
+conda run -n ucmec uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+Open **[http://localhost:8000](http://localhost:8000)** in your browser to access the research dashboard.
+
+### API Endpoints
+- `GET  /api/health`: Health status, worker state, and queue length.
+- `GET  /api/capabilities`: Solvers, algorithms, and system dependency versions.
+- `GET  /api/presets`: Pre-configured scalarization weight profiles.
+- `POST /api/experiments`: Launch a new durable training experiment.
+- `GET  /api/experiments`: Paginated list of experiments.
+- `GET  /api/experiments/{id}`: Detailed experiment state and parameters.
+- `POST /api/experiments/{id}/cancel`: Safely terminate a running experiment.
+- `GET  /api/experiments/{id}/metrics`: Structured time-series metrics.
+- `GET  /api/experiments/{id}/logs`: Tail live subprocess stdout/stderr.
+- `GET  /api/experiments/{id}/artifacts`: List generated checkpoints and CSV/JSON files.
+- `GET  /api/experiments/{id}/artifacts/{path}`: Secure artifact download with path traversal shield.
+- `GET  /api/comparisons`: 4D empirical non-dominance comparison across all completed runs.
+
+---
+
+## 4. Building the Frontend
+The frontend is built with React 19, TypeScript, Vite, Recharts, and Lucide-React:
+```powershell
+cd frontend
+npm install
+npm run build
+```
+Static production assets are outputted to `frontend/dist/` and automatically mounted by FastAPI.
+
+---
+
+## 5. Deployment with Docker Compose
+
+A production-ready container stack is provided:
+```bash
+# Build and start services in background
+docker compose up -d --build
+
+# View logs
+docker compose logs -f
+
+# Check health
+curl http://localhost:8000/api/health
+```
+
+---
+
+## 6. Documentation Index
+- [Metric Contract & Physical Models](docs/metric_contract.md)
+- [System Architecture](docs/architecture.md)
+- [Changelog & Baseline Repairs](docs/changelog.md)
+- [Research Evaluation Protocol](docs/research_protocol.md)
+- [Research Contribution Draft](docs/research_contribution_draft.md)
