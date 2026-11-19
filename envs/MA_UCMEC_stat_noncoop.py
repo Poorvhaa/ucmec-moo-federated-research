@@ -3,16 +3,55 @@ from gym import spaces
 from gym.utils import seeding
 import numpy as np
 import math
-# from stable_baselines3.common.env_checker import check_env
 import cvxpy as cp
+from typing import Optional, Dict, Any
+
+from moo.config import PRESETS, DEFAULT_PHYSICAL_PARAMS, DEFAULT_REFERENCE_SCALES
+from moo.metrics import MetricContract, StepMetricSnapshot
+from moo.scalarization import MultiObjectiveScalarizer
+from moo.diagnostics import SolverDiagnosticsTracker, solve_cpu_allocation
 
 
 class MA_UCMEC_stat_noncoop(object):
-    def __init__(self, render: bool = False):
+    def __init__(
+        self,
+        render: bool = False,
+        preset_name: str = "legacy",
+        moo_weights: Optional[Dict[str, float]] = None,
+        reference_scales: Optional[Dict[str, float]] = None,
+        physical_params: Optional[Dict[str, Any]] = None,
+        use_corrected_cpu_alloc: Optional[bool] = None,
+        max_steps: int = 200,
+        solver_name: str = "CLARABEL",
+        failure_dump_dir: Optional[str] = "experiments_storage/solver_failures",
+    ):
         # Initialization
         self.is_mobile = False
         gym.logger.set_level(40)
         np.random.seed(37)
+        self.max_steps = max_steps
+        self.solver_name = solver_name
+        self.preset_name = preset_name
+        
+        # Configure preset & MOO settings
+        preset_cfg = PRESETS.get(preset_name, PRESETS["legacy"])
+        selected_mode = preset_cfg.get("mode", "legacy")
+        weights = moo_weights if moo_weights is not None else preset_cfg.get("weights", {"w_delay": 1.0, "w_energy": 0.0, "w_overhead": 0.0, "w_reliability": 0.0})
+        
+        if use_corrected_cpu_alloc is not None:
+            self.use_corrected_cpu_alloc = use_corrected_cpu_alloc
+        else:
+            self.use_corrected_cpu_alloc = preset_cfg.get("use_corrected_cpu_alloc", True)
+
+        self.metric_contract = MetricContract(physical_params)
+        self.scalarizer = MultiObjectiveScalarizer(
+            weights=weights,
+            reference_scales=reference_scales,
+            mode=selected_mode
+        )
+        self.solver_tracker = SolverDiagnosticsTracker(failure_dump_dir=failure_dump_dir)
+        self.last_metric_snapshot: Optional[StepMetricSnapshot] = None
+        self.last_solver_diagnostics: list = []
         self.M = 60  # number of users
         self.N = 60  # number of APs
         self.varsig = 16  # number of antennas of each AP
@@ -311,6 +350,8 @@ class MA_UCMEC_stat_noncoop(object):
         return front_rate_user
 
     def seed(self, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
         self.np_random, seed = gym.utils.seeding.np_random(seed)
         return [seed]
 
@@ -318,6 +359,10 @@ class MA_UCMEC_stat_noncoop(object):
         pass
 
     def reset(self):
+        self.step_num = 0
+        self.omega_last.fill(0)
+        self.p_last.fill(0)
+        self.delay_last.fill(0)
         sub_agent_obs = []
         for i in range(self.agent_num):
             sub_obs = np.random.uniform(low=self.obs_low, high=self.obs_high, size=(self.obs_dim,))
@@ -433,6 +478,7 @@ class MA_UCMEC_stat_noncoop(object):
 
         # Each CPU solves a resource allocation optimization problem
         actual_C = np.zeros([self.M_sim, self.K])
+        step_solver_diagnostics = []
         for i in range(self.K):
             serve_user_id = []
             serve_user_task = []
@@ -446,81 +492,132 @@ class MA_UCMEC_stat_noncoop(object):
                     serve_user_task.append(task_mat[j, i])
                     _local_delay.append(local_delay[j, 0])
                     _uplink_delay.append(uplink_delay[j, 0])
+                    _front_delay.append(front_delay[j, 0])
             if len(serve_user_id) == 0:
                 continue
-            C = cp.Variable(len(serve_user_id))
-            _process_delay = cp.multiply(serve_user_task, cp.inv_pos(C))
-            _local_delay = np.array(_local_delay)
-            _uplink_delay = np.array(_uplink_delay)
+            capacity = float(self.C_edge[i, 0])
+            
+            allocated_cpu, diag = solve_cpu_allocation(
+                cpu_id=i,
+                capacity=capacity,
+                user_ids=serve_user_id,
+                tasks=np.asarray(serve_user_task, dtype=float),
+                local_delays=np.asarray(_local_delay, dtype=float),
+                uplink_delays=np.asarray(_uplink_delay, dtype=float),
+                front_delays=np.asarray(_front_delay, dtype=float),
+                use_corrected_cpu_alloc=self.use_corrected_cpu_alloc,
+                solver_name=self.solver_name,
+                tracker=self.solver_tracker,
+            )
+            step_solver_diagnostics.append(diag.to_dict())
+            for k, user_id in enumerate(serve_user_id):
+                actual_C[user_id, i] = allocated_cpu[k]
 
-            func = cp.Minimize(cp.sum(cp.maximum(_local_delay, _uplink_delay + _process_delay)))
-            cons = [0 <= C, cp.sum(C) <= self.C_edge[i, 0]]
-            prob = cp.Problem(func, cons)
-            prob.solve(solver=cp.SCS, verbose=False)
-            for k in range(len(serve_user_id)):
-                _C = C.value
-                actual_C[serve_user_id[k], i] = _C[k]
+        self.last_solver_diagnostics = step_solver_diagnostics
 
         actual_process_delay = np.zeros([self.M_sim, 1])
         for i in range(self.M_sim):
             if omega_current[i] != 0:
                 CPU_id = int(omega_current[i] - 1)
-                actual_process_delay[i, 0] = task_mat[i, CPU_id] / np.sum(actual_C[i, :])
-        '''
-        process_delay = cp.max(cp.multiply(task_mat, cp.inv_pos(C)))  # Mx1
-        func = cp.Minimize(cp.sum(cp.maximum(local_delay, front_delay + uplink_delay + process_delay)))
-        # func = cp.Minimize(cp.sum(cp.maximum(local_delay, process_delay)))
-        cons = [0 <= C]
-        for i in range(K):
-            cons += [cp.sum(C[:, i]) <= C_edge[i, 0]]
+                actual_process_delay[i, 0] = task_mat[i, CPU_id] / max(1e-6, float(np.sum(actual_C[i, :])))
 
-        prob = cp.Problem(func, cons)
-        prob.solve(solver=cp.SCS, verbose=False)
-        actual_C = C.value
-        actual_process_delay = np.max(task_mat / actual_C, axis=1)
-        # print(actual_process_delay)
-        # print(C.value)
-        '''
-
-        # reward calculation
-        # print("Uplink Delay:", uplink_delay)
-        # print("Local Delay:", local_delay)
-        # print("Front Delay:", front_delay)
-        # print("Edge Processing Delay:", actual_process_delay)
-        # print("Offloading Delay:", front_delay + uplink_delay + actual_process_delay)
+        # Total delay calculation: mutually exclusive paths
         total_delay = np.zeros([self.M_sim, 1])
         for i in range(self.M_sim):
-            total_delay[i, 0] = np.maximum(local_delay[i, 0],
-                                           front_delay[i, 0] + uplink_delay[i, 0] + actual_process_delay[i, 0])
-        if self.step_num > 20:
-            done = [1] * self.M_sim
-        else:
-            done = [0] * self.M_sim
+            if omega_current[i] == 0:
+                total_delay[i, 0] = local_delay[i, 0]
+            else:
+                total_delay[i, 0] = front_delay[i, 0] + uplink_delay[i, 0] + actual_process_delay[i, 0]
 
-        reward = np.zeros([self.M_sim, 1])
+        # Multi-objective metrics evaluation
+        metric_snapshot = self.metric_contract.compute_step_metrics(
+            omega=omega_current,
+            p=p_current,
+            local_delay=local_delay,
+            uplink_delay=uplink_delay,
+            front_delay=front_delay,
+            process_delay=actual_process_delay,
+            task_size_bits=self.Task_size,
+            task_density=self.Task_density,
+            c_user=self.C_user,
+            c_actual=actual_C,
+            sinr_access=SINR_access if 'SINR_access' in locals() else None,
+        )
+        self.last_metric_snapshot = metric_snapshot
+
+        # Per-user arrays for scalarization
+        per_user_delay_s = total_delay.flatten()
+        per_user_energy_j = np.zeros(self.M_sim, dtype=float)
+        kappa_u = float(self.metric_contract.params["kappa_user"])
         for i in range(self.M_sim):
-            reward[i, 0] = -0.9 * total_delay[i, 0] + 0.1 * (self.tau_c - total_delay[i, 0])
-        # print("Average Total Delay (ms):", np.sum(total_delay) * 1000 / self.M_sim)
-        # print("Average Uplink Rate (Mbps):", np.sum(uplink_rate_access) / (self.M_sim * 1e6))
+            if omega_current[i] == 0:
+                cycles = float(self.Task_density[0, i] * self.Task_size[0, i])
+                per_user_energy_j[i] = kappa_u * cycles * float(self.C_user[0, i] ** 2)
+            else:
+                per_user_energy_j[i] = float(p_current[i] * uplink_delay[i, 0])
+
+        per_user_overhead_b = np.zeros(self.M_sim, dtype=float)
+        fixed_sig = (
+            float(self.metric_contract.params["csi_pilot_bytes"])
+            + float(self.metric_contract.params["offload_request_bytes"])
+            + float(self.metric_contract.params["scheduling_grant_bytes"])
+            + float(self.metric_contract.params["fronthaul_signaling_bytes"])
+            + float(self.metric_contract.params["ack_bytes"])
+        )
+        for i in range(self.M_sim):
+            if omega_current[i] != 0:
+                per_user_overhead_b[i] = fixed_sig
+
+        deadline_s = float(self.metric_contract.params["task_deadline_s"])
+        per_user_success = per_user_delay_s <= deadline_s
+
+        reward, reward_diagnostics = self.scalarizer.compute_agent_rewards(
+            per_user_delay_s=per_user_delay_s,
+            per_user_energy_j=per_user_energy_j,
+            per_user_overhead_b=per_user_overhead_b,
+            per_user_success=per_user_success,
+            tau_c=self.tau_c,
+        )
+
+        is_truncated = self.step_num >= self.max_steps
+        done = [1 if is_truncated else 0] * self.M_sim
+
         sub_agent_obs = []
         sub_agent_reward = []
         sub_agent_done = []
         sub_agent_info = []
-        observation = np.empty([self.obs_dim])
+
         for i in range(self.agent_num):
+            observation = np.zeros(self.obs_dim, dtype=np.float32)
             if self.step_num == 1:
-                observation[0] = 0
-                observation[1] = 0
-                observation[2] = 0
+                observation[0] = 0.0
+                observation[1] = 0.0
+                observation[2] = 0.0
             else:
-                observation[0] = self.omega_last[i]
-                observation[1] = self.p_last[i]
-                observation[2] = self.delay_last[i, 0]
-            observation = np.array(observation)
-            sub_agent_obs.append(observation.flatten())
+                observation[0] = float(self.omega_last[i])
+                observation[1] = float(self.p_last[i])
+                observation[2] = float(self.delay_last[i, 0])
+
+            info = {
+                "individual_reward": float(reward[i, 0]),
+                "bad_transition": is_truncated,
+                "TimeLimit.truncated": is_truncated,
+                "delay_s": float(per_user_delay_s[i]),
+                "delay_ms": float(per_user_delay_s[i] * 1000.0),
+                "energy_j": float(per_user_energy_j[i]),
+                "energy_mj": float(per_user_energy_j[i] * 1000.0),
+                "overhead_bytes": float(per_user_overhead_b[i]),
+                "task_success": bool(per_user_success[i]),
+                "step_metrics": metric_snapshot.to_dict(),
+                "reward_diagnostics": reward_diagnostics,
+                "solver_diagnostics": step_solver_diagnostics,
+            }
+
+            sub_agent_obs.append(observation)
             sub_agent_reward.append(reward[i])
             sub_agent_done.append(done[i])
-            sub_agent_info.append({})
+            sub_agent_info.append(info)
+
         self.delay_last = total_delay
         self.omega_last = omega_current
         self.p_last = p_current

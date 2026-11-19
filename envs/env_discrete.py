@@ -31,8 +31,8 @@ class DiscreteActionEnv(object):
     Wrapper for discrete action environment.
     """
 
-    def __init__(self):
-        self.env = MA_UCMEC_stat_noncoop()
+    def __init__(self, **kwargs):
+        self.env = MA_UCMEC_stat_noncoop(**kwargs)
         self.num_agent = self.env.agent_num
         self.signal_obs_dim = self.env.obs_dim
         self.signal_action_dim = self.env.action_dim
@@ -114,8 +114,10 @@ class DiscreteActionEnv(object):
     def render(self, mode="rgb_array"):
         pass
 
-    def seed(self, seed):
-        pass
+    def seed(self, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+        return self.env.seed(seed)
 
 
 class MultiDiscrete:
