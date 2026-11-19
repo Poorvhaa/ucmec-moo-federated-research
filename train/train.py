@@ -20,19 +20,47 @@ from envs.env_wrappers import DummyVecEnv
 """Train script for MPEs."""
 
 
+def get_env_kwargs(all_args):
+    moo_weights = None
+    if any(getattr(all_args, k, None) is not None for k in ["w_delay", "w_energy", "w_overhead", "w_reliability"]):
+        moo_weights = {
+            "w_delay": getattr(all_args, "w_delay", 0.0) or 0.0,
+            "w_energy": getattr(all_args, "w_energy", 0.0) or 0.0,
+            "w_overhead": getattr(all_args, "w_overhead", 0.0) or 0.0,
+            "w_reliability": getattr(all_args, "w_reliability", 0.0) or 0.0,
+        }
+
+    use_corrected = not getattr(all_args, "legacy_cpu_alloc", False)
+
+    physical_params = {
+        "task_deadline_s": getattr(all_args, "task_deadline_s", 0.1),
+        "channel_mode": getattr(all_args, "channel_mode", "legacy"),
+    }
+
+    reference_scales = {
+        "delay_ref_s": getattr(all_args, "delay_ref_s", 0.1),
+        "energy_ref_j": getattr(all_args, "energy_ref_j", 0.005),
+        "overhead_ref_bytes": getattr(all_args, "overhead_ref_bytes", 1000.0),
+        "reliability_ref": 1.0,
+    }
+
+    return {
+        "preset_name": getattr(all_args, "moo_preset", "legacy"),
+        "moo_weights": moo_weights,
+        "reference_scales": reference_scales,
+        "physical_params": physical_params,
+        "use_corrected_cpu_alloc": use_corrected,
+        "max_steps": getattr(all_args, "episode_length", 200),
+        "solver_name": getattr(all_args, "solver_name", "CLARABEL"),
+    }
+
+
 def make_train_env(all_args):
+    env_kwargs = get_env_kwargs(all_args)
     def get_env_fn(rank):
         def init_env():
-            # TODO 注意注意，这里选择连续还是离散可以选择注释上面两行，或者下面两行。
-            # TODO Important, here you can choose continuous or discrete action space by uncommenting the above two lines or the below two lines.
-
-            # from envs.env_continuous import ContinuousActionEnv
-            #
-            # env = ContinuousActionEnv()
-
             from envs.env_discrete import DiscreteActionEnv
-            env = DiscreteActionEnv()
-
+            env = DiscreteActionEnv(**env_kwargs)
             env.seed(all_args.seed + rank * 1000)
             return env
 
@@ -42,27 +70,60 @@ def make_train_env(all_args):
 
 
 def make_eval_env(all_args):
+    env_kwargs = get_env_kwargs(all_args)
     def get_env_fn(rank):
         def init_env():
-            # TODO 注意注意，这里选择连续还是离散可以选择注释上面两行，或者下面两行。
-            # TODO Important, here you can choose continuous or discrete action space by uncommenting the above two lines or the below two lines.
-            # from envs.env_continuous import ContinuousActionEnv
-            #
-            # env = ContinuousActionEnv()
             from envs.env_discrete import DiscreteActionEnv
-            env = DiscreteActionEnv()
+            env = DiscreteActionEnv(**env_kwargs)
             env.seed(all_args.seed + rank * 1000)
             return env
 
         return init_env
 
-    return DummyVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
+    return DummyVecEnv([get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)])
 
 
 def parse_args(args, parser):
     parser.add_argument("--scenario_name", type=str, default="MyEnv", help="Which scenario to run on")
     parser.add_argument("--num_landmarks", type=int, default=3)
     parser.add_argument("--num_agents", type=int, default=10, help="number of players")
+
+    # MOO parameters
+    parser.add_argument(
+        "--moo_preset",
+        type=str,
+        default="legacy",
+        choices=["legacy", "delay_only", "balanced", "energy_priority", "reliability_priority", "custom"],
+        help="MOO preset configuration",
+    )
+    parser.add_argument("--w_delay", type=float, default=None, help="Scalarization weight for delay")
+    parser.add_argument("--w_energy", type=float, default=None, help="Scalarization weight for energy")
+    parser.add_argument("--w_overhead", type=float, default=None, help="Scalarization weight for overhead")
+    parser.add_argument("--w_reliability", type=float, default=None, help="Scalarization weight for reliability")
+    parser.add_argument("--delay_ref_s", type=float, default=0.1, help="Reference delay scale (s)")
+    parser.add_argument("--energy_ref_j", type=float, default=0.005, help="Reference energy scale (J)")
+    parser.add_argument("--overhead_ref_bytes", type=float, default=1000.0, help="Reference overhead scale (B)")
+    parser.add_argument("--task_deadline_s", type=float, default=0.1, help="Task deadline (s)")
+    parser.add_argument(
+        "--channel_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "sinr_outage"],
+        help="Channel reliability model mode",
+    )
+    parser.add_argument(
+        "--legacy_cpu_alloc",
+        action="store_true",
+        default=False,
+        help="Use uncorrected legacy CPU allocation omitting fronthaul delay",
+    )
+    parser.add_argument(
+        "--solver_name",
+        type=str,
+        default="CLARABEL",
+        choices=["CLARABEL", "SCS"],
+        help="Convex solver name",
+    )
 
     all_args = parser.parse_known_args(args)[0]
 
@@ -169,7 +230,7 @@ def main(args):
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
 
-    runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+    runner.writter.export_scalars_to_json(str(runner.log_dir + "/tb_summary.json"))
     runner.writter.close()
 
 

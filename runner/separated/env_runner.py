@@ -8,6 +8,9 @@ from utils.util import update_linear_schedule
 from runner.separated.base_runner import Runner
 
 
+from moo.logging_helper import ExperimentMetricLogger
+
+
 def _t2n(x):
     return x.detach().cpu().numpy()
 
@@ -15,6 +18,10 @@ def _t2n(x):
 class EnvRunner(Runner):
     def __init__(self, config):
         super(EnvRunner, self).__init__(config)
+        self.metric_logger = ExperimentMetricLogger(
+            log_dir=str(self.log_dir),
+            experiment_config=vars(self.all_args) if hasattr(self.all_args, "__dict__") else {}
+        )
 
     def run(self):
         self.warmup()
@@ -26,6 +33,7 @@ class EnvRunner(Runner):
                 for agent_id in range(self.num_agents):
                     self.trainer[agent_id].policy.lr_decay(episode, episodes)
 
+            episode_infos = []
             for step in range(self.episode_length):
                 # Sample actions
                 (
@@ -39,6 +47,7 @@ class EnvRunner(Runner):
 
                 # Obser reward and next obs
                 obs, rewards, dones, infos = self.envs.step(actions_env)
+                episode_infos.append(infos)
 
                 data = (
                     obs,
@@ -84,6 +93,15 @@ class EnvRunner(Runner):
                     )
                 )
 
+                # Structured MOO metrics logging
+                self.metric_logger.log_episode(
+                    episode=episode,
+                    total_steps=total_num_steps,
+                    rewards=rewards,
+                    infos=episode_infos,
+                    writer=self.writter,
+                )
+
                 if self.env_name == "MPE":
                     for agent_id in range(self.num_agents):
                         idv_rews = []
@@ -104,6 +122,10 @@ class EnvRunner(Runner):
                 self.eval(total_num_steps)
         file_name = 'reward.mat'
         savemat(file_name, {'reward': reward_list})
+        self.metric_logger.finalize_summary(
+            status="completed",
+            runtime_s=time.time() - start
+        )
 
     def warmup(self):
         # reset env
@@ -210,7 +232,27 @@ class EnvRunner(Runner):
             dtype=np.float32,
         )
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+        bad_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        for t in range(self.n_rollout_threads):
+            for a in range(self.num_agents):
+                is_truncated = False
+                if len(infos) > t and len(infos[t]) > a:
+                    info_a = infos[t][a]
+                    if isinstance(info_a, dict) and (info_a.get("bad_transition", False) or info_a.get("TimeLimit.truncated", False)):
+                        is_truncated = True
+
+                if dones[t, a]:
+                    if is_truncated:
+                        # Time limit truncation: cut GAE recursion
+                        bad_masks[t, a] = 0.0
+                        if getattr(self.all_args, "use_proper_time_limits", False):
+                            # Preserve value bootstrapping across the time limit boundary
+                            masks[t, a] = 1.0
+                        else:
+                            masks[t, a] = 0.0
+                    else:
+                        bad_masks[t, a] = 1.0
+                        masks[t, a] = 0.0
 
         share_obs = []
         for o in obs:
@@ -231,6 +273,7 @@ class EnvRunner(Runner):
                 values[:, agent_id],
                 rewards[:, agent_id],
                 masks[:, agent_id],
+                bad_masks=bad_masks[:, agent_id],
             )
 
     @torch.no_grad()

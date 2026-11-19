@@ -15,6 +15,9 @@ from scipy.io import savemat
 # import imageio
 
 
+from moo.logging_helper import ExperimentMetricLogger
+
+
 def _t2n(x):
     return x.detach().cpu().numpy()
 
@@ -24,7 +27,10 @@ class EnvRunner(Runner):
 
     def __init__(self, config):
         super(EnvRunner, self).__init__(config)
-
+        self.metric_logger = ExperimentMetricLogger(
+            log_dir=str(self.log_dir),
+            experiment_config=vars(self.all_args) if hasattr(self.all_args, "__dict__") else {}
+        )
 
     def run(self):
         self.warmup()
@@ -36,6 +42,7 @@ class EnvRunner(Runner):
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
 
+            episode_infos = []
             for step in range(self.episode_length):
                 # Sample actions
                 (
@@ -49,6 +56,7 @@ class EnvRunner(Runner):
 
                 # Obser reward and next obs
                 obs, rewards, dones, infos = self.envs.step(actions_env)
+                episode_infos.append(infos)
 
                 data = (
                     obs,
@@ -92,26 +100,30 @@ class EnvRunner(Runner):
                     )
                 )
 
-                # if self.env_name == "MPE":
-                #     env_infos = {}
-                #     for agent_id in range(self.num_agents):
-                #         idv_rews = []
-                #         for info in infos:
-                #             if 'individual_reward' in info[agent_id].keys():
-                #                 idv_rews.append(info[agent_id]['individual_reward'])
-                #         agent_k = 'agent%i/individual_rewards' % agent_id
-                #         env_infos[agent_k] = idv_rews
-
-                # train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
                 train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards)
                 print("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
                 self.log_train(train_infos, total_num_steps)
                 reward_list[episode, 0] = np.mean(self.buffer.rewards)
-                # self.log_env(env_infos, total_num_steps)
+
+                # Structured MOO metrics logging
+                self.metric_logger.log_episode(
+                    episode=episode,
+                    total_steps=total_num_steps,
+                    rewards=self.buffer.rewards,
+                    infos=episode_infos,
+                    writer=self.writter,
+                )
 
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
                 self.eval(total_num_steps)
+
+        file_name = 'reward.mat'
+        savemat(file_name, {'reward': reward_list})
+        self.metric_logger.finalize_summary(
+            status="completed",
+            runtime_s=time.time() - start
+        )
 
         file_name = 'reward.mat'
         savemat(file_name, {'reward': reward_list})
@@ -208,7 +220,27 @@ class EnvRunner(Runner):
             dtype=np.float32,
         )
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+        bad_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        for t in range(self.n_rollout_threads):
+            for a in range(self.num_agents):
+                is_truncated = False
+                if len(infos) > t and len(infos[t]) > a:
+                    info_a = infos[t][a]
+                    if isinstance(info_a, dict) and (info_a.get("bad_transition", False) or info_a.get("TimeLimit.truncated", False)):
+                        is_truncated = True
+
+                if dones[t, a]:
+                    if is_truncated:
+                        # Time limit truncation: cut GAE recursion
+                        bad_masks[t, a] = 0.0
+                        if getattr(self.all_args, "use_proper_time_limits", False):
+                            # Preserve value bootstrapping across the time limit boundary
+                            masks[t, a] = 1.0
+                        else:
+                            masks[t, a] = 0.0
+                    else:
+                        bad_masks[t, a] = 1.0
+                        masks[t, a] = 0.0
 
         if self.use_centralized_V:
             share_obs = obs.reshape(self.n_rollout_threads, -1)
@@ -226,6 +258,7 @@ class EnvRunner(Runner):
             values,
             rewards,
             masks,
+            bad_masks=bad_masks,
         )
 
     @torch.no_grad()
