@@ -54,6 +54,9 @@ class SharedReplayBuffer(object):
         self.value_preds = np.zeros(
             (self.episode_length + 1, self.n_rollout_threads, num_agents, 1), dtype=np.float32)
         self.returns = np.zeros_like(self.value_preds)
+        self.terminal_value_preds = np.zeros_like(self.value_preds)
+        self.has_terminal_value = np.zeros(
+            (self.episode_length + 1, self.n_rollout_threads, num_agents, 1), dtype=bool)
 
         if act_space.__class__.__name__ == 'Discrete':
             self.available_actions = np.ones((self.episode_length + 1, self.n_rollout_threads, num_agents, act_space.n),
@@ -77,7 +80,8 @@ class SharedReplayBuffer(object):
         self.step = 0
 
     def insert(self, share_obs, obs, rnn_states_actor, rnn_states_critic, actions, action_log_probs,
-               value_preds, rewards, masks, bad_masks=None, active_masks=None, available_actions=None):
+               value_preds, rewards, masks, bad_masks=None, active_masks=None, available_actions=None,
+               terminal_value_preds=None, has_terminal_value=None):
         """
         Insert data into the buffer.
         :param share_obs: (argparse.Namespace) arguments containing relevant model, policy, and env information.
@@ -109,6 +113,11 @@ class SharedReplayBuffer(object):
             self.active_masks[self.step + 1] = active_masks.copy()
         if available_actions is not None:
             self.available_actions[self.step + 1] = available_actions.copy()
+        if terminal_value_preds is not None and has_terminal_value is not None:
+            self.terminal_value_preds[self.step + 1] = terminal_value_preds.copy()
+            self.has_terminal_value[self.step + 1] = has_terminal_value.copy()
+        else:
+            self.has_terminal_value[self.step + 1] = False
 
         self.step = (self.step + 1) % self.episode_length
 
@@ -177,16 +186,21 @@ class SharedReplayBuffer(object):
                 self.value_preds[-1] = next_value
                 gae = 0
                 for step in reversed(range(self.rewards.shape[0])):
+                    next_v = (
+                        np.where(self.has_terminal_value[step + 1], self.terminal_value_preds[step + 1], self.value_preds[step + 1])
+                        if hasattr(self, "has_terminal_value")
+                        else self.value_preds[step + 1]
+                    )
                     if self._use_popart or self._use_valuenorm:
                         # step + 1
                         delta = self.rewards[step] + self.gamma * value_normalizer.denormalize(
-                            self.value_preds[step + 1]) * self.masks[step + 1] \
+                            next_v) * self.masks[step + 1] \
                                 - value_normalizer.denormalize(self.value_preds[step])
                         gae = delta + self.gamma * self.gae_lambda * gae * self.masks[step + 1]
                         gae = gae * self.bad_masks[step + 1]
                         self.returns[step] = gae + value_normalizer.denormalize(self.value_preds[step])
                     else:
-                        delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - \
+                        delta = self.rewards[step] + self.gamma * next_v * self.masks[step + 1] - \
                                 self.value_preds[step]
                         gae = delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
                         gae = gae * self.bad_masks[step + 1]

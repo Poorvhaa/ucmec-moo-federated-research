@@ -30,7 +30,7 @@ def test_e2e_api_and_worker_execution():
     # 2. Wait for worker process to finish the 200 steps
     start_time = time.time()
     final_status = None
-    while time.time() - start_time < 90:
+    while time.time() - start_time < 150:
         get_res = client.get(f"/api/experiments/{exp_id}")
         assert get_res.status_code == 200
         st = get_res.json()

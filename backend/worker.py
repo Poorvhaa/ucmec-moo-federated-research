@@ -65,10 +65,16 @@ class ExperimentWorker:
                 exp_id = self.job_queue.get()
                 if exp_id in self.cancelled_jobs:
                     self.db.update_experiment_status(exp_id, status="cancelled", finished_at=time.time())
+                    self.db.update_federated_experiment_status(exp_id, status="cancelled", finished_at=time.time())
                     self.job_queue.task_done()
                     continue
 
-                self._execute_experiment(exp_id)
+                fed_exp = self.db.get_federated_experiment(exp_id)
+                if fed_exp:
+                    self._execute_federated_experiment(exp_id)
+                else:
+                    self._execute_experiment(exp_id)
+
                 self.job_queue.task_done()
             except Exception as e:
                 time.sleep(1.0)
@@ -238,5 +244,171 @@ class ExperimentWorker:
                 finished_at=finish_time,
                 runtime_s=runtime,
                 final_metrics=final_metrics,
+                error_message=err_msg[:500]
+            )
+
+    def _execute_federated_experiment(self, exp_id: str):
+        exp = self.db.get_federated_experiment(exp_id)
+        if not exp:
+            return
+
+        start_time = time.time()
+        self.db.update_federated_experiment_status(exp_id, status="running", started_at=start_time)
+        
+        log_dir = Path(exp["log_dir"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = log_dir / "stdout.log"
+        stderr_path = log_dir / "stderr.log"
+
+        python_exe = sys.executable
+
+        cmd = [
+            python_exe,
+            "federated/runner.py",
+            "--experiment_name", exp["name"],
+            "--fed_num_clients", str(exp["num_clients"]),
+            "--fed_num_rounds", str(exp["num_rounds"]),
+            "--fed_min_clients", str(exp["min_clients"]),
+            "--fed_participation_rate", str(exp["participation_rate"]),
+            "--fed_dropout_prob", str(exp["dropout_prob"]),
+            "--fed_scenario_type", exp["scenario_type"],
+            "--moo_preset", exp["preset_name"],
+            "--seed", str(exp["seed"]),
+            "--solver_name", exp.get("solver_name", "CLARABEL"),
+            "--channel_mode", exp.get("channel_mode", "legacy"),
+            "--fed_output_dir", str(log_dir),
+            "--cuda",
+        ]
+
+        with open(stdout_path, "w", encoding="utf-8") as f_out, open(stderr_path, "w", encoding="utf-8") as f_err:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=f_out,
+                    stderr=f_err,
+                    cwd=str(Path.cwd()),
+                    env=os.environ.copy()
+                )
+                with self.lock:
+                    self.active_processes[exp_id] = proc
+            except Exception as e:
+                self.db.update_federated_experiment_status(
+                    exp_id,
+                    status="failed",
+                    finished_at=time.time(),
+                    error_message=f"Failed to start federated subprocess: {str(e)}"
+                )
+                return
+
+        checkpoints_dir = log_dir / "checkpoints"
+        ingested_rounds = set()
+
+        while proc.poll() is None:
+            time.sleep(1.0)
+            if exp_id in self.cancelled_jobs:
+                self._terminate_process(proc)
+                self.db.update_federated_experiment_status(
+                    exp_id,
+                    status="cancelled",
+                    finished_at=time.time(),
+                    runtime_s=time.time() - start_time
+                )
+                with self.lock:
+                    self.active_processes.pop(exp_id, None)
+                return
+
+            if checkpoints_dir.exists():
+                manifests = sorted(list(checkpoints_dir.glob("round_*_manifest.json")))
+                for mf in manifests:
+                    try:
+                        r_num = int(mf.stem.split("_")[1])
+                        if r_num not in ingested_rounds:
+                            with open(mf, "r", encoding="utf-8") as jf:
+                                r_data = json.load(jf)
+                                self.db.insert_federated_round(exp_id, r_data)
+                                ingested_rounds.add(r_num)
+                                prog = min(100.0, (r_num / exp["num_rounds"]) * 100.0)
+                                self.db.update_federated_experiment_status(
+                                    exp_id,
+                                    status="running",
+                                    current_round=r_num,
+                                    progress_percent=prog,
+                                    runtime_s=time.time() - start_time
+                                )
+                    except Exception:
+                        pass
+
+        returncode = proc.poll()
+        finish_time = time.time()
+        runtime = finish_time - start_time
+
+        with self.lock:
+            self.active_processes.pop(exp_id, None)
+
+        # Ingest remaining round manifests
+        if checkpoints_dir.exists():
+            manifests = sorted(list(checkpoints_dir.glob("round_*_manifest.json")))
+            for mf in manifests:
+                try:
+                    r_num = int(mf.stem.split("_")[1])
+                    if r_num not in ingested_rounds:
+                        with open(mf, "r", encoding="utf-8") as jf:
+                            r_data = json.load(jf)
+                            self.db.insert_federated_round(exp_id, r_data)
+                            ingested_rounds.add(r_num)
+                except Exception:
+                    pass
+
+        comm_summary = None
+        ledger_file = log_dir / "communication_ledger.json"
+        if ledger_file.exists():
+            try:
+                with open(ledger_file, "r", encoding="utf-8") as lf:
+                    ledger_data = json.load(lf)
+                    comm_summary = ledger_data.get("summary")
+            except Exception:
+                pass
+
+        final_metrics = None
+        latest_manifest = checkpoints_dir / f"round_{exp['num_rounds']}_manifest.json"
+        if latest_manifest.exists():
+            try:
+                with open(latest_manifest, "r", encoding="utf-8") as jf:
+                    m_data = json.load(jf)
+                    final_metrics = {
+                        "local": m_data.get("local_training_metrics"),
+                        "eval": m_data.get("eval_metrics")
+                    }
+            except Exception:
+                pass
+
+        if returncode == 0:
+            self.db.update_federated_experiment_status(
+                exp_id,
+                status="completed",
+                current_round=exp["num_rounds"],
+                progress_percent=100.0,
+                finished_at=finish_time,
+                runtime_s=runtime,
+                final_metrics=final_metrics,
+                communication_summary=comm_summary
+            )
+        else:
+            err_msg = f"Federated process exited with code {returncode}."
+            if stderr_path.exists():
+                try:
+                    with open(stderr_path, "r", encoding="utf-8") as f_err:
+                        lines = f_err.readlines()
+                        if lines:
+                            err_msg += " " + "".join(lines[-5:]).strip()
+                except Exception:
+                    pass
+            self.db.update_federated_experiment_status(
+                exp_id,
+                status="failed",
+                finished_at=finish_time,
+                runtime_s=runtime,
+                final_metrics=final_metrics,
+                communication_summary=comm_summary,
                 error_message=err_msg[:500]
             )

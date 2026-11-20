@@ -12,7 +12,8 @@ import {
   Terminal,
   Cpu,
   Radio,
-  StopCircle
+  StopCircle,
+  Network
 } from 'lucide-react';
 import {
   LineChart,
@@ -41,9 +42,10 @@ import {
   getArtifactDownloadUrl
 } from './api';
 import type { PresetInfo, Experiment, Capabilities, ComparisonItem, ArtifactFile, MetricRecord } from './types';
+import { FederatedView } from './FederatedView';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<'overview' | 'create' | 'live' | 'compare' | 'tradeoff' | 'artifacts'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'create' | 'live' | 'compare' | 'tradeoff' | 'artifacts' | 'federation'>('overview');
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [selectedExpId, setSelectedExpId] = useState<string | null>(null);
   const [selectedExp, setSelectedExp] = useState<Experiment | null>(null);
@@ -235,6 +237,12 @@ export function App() {
             onClick={() => setActiveTab('artifacts')}
           >
             <FolderArchive size={18} /> Artifacts
+          </button>
+          <button
+            className={`nav-btn ${activeTab === 'federation' ? 'active' : ''}`}
+            onClick={() => setActiveTab('federation')}
+          >
+            <Network size={18} /> Federated Learning
           </button>
         </nav>
 
@@ -949,6 +957,11 @@ export function App() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* 7. FEDERATED LEARNING TAB */}
+        {activeTab === 'federation' && (
+          <FederatedView presets={presets} capabilities={capabilities} />
         )}
       </main>
     </div>

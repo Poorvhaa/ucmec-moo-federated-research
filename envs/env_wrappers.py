@@ -35,12 +35,18 @@ class DummyVecEnv():
         obs, rews, dones, infos = map(np.array, zip(*results))
 
         for (i, done) in enumerate(dones):
-            if 'bool' in done.__class__.__name__:
-                if done:
-                    obs[i] = self.envs[i].reset()
-            else:
-                if np.all(done):
-                    obs[i] = self.envs[i].reset()
+            is_done = done if 'bool' in done.__class__.__name__ else np.all(done)
+            if is_done:
+                terminal_obs = obs[i].copy()
+                if isinstance(infos[i], (np.ndarray, list)):
+                    for a_idx, info_a in enumerate(infos[i]):
+                        if isinstance(info_a, dict):
+                            info_a['terminal_observation'] = terminal_obs[a_idx].copy()
+                            info_a['terminal_share_observation'] = terminal_obs.reshape(-1).copy()
+                elif isinstance(infos[i], dict):
+                    infos[i]['terminal_observation'] = terminal_obs.copy()
+                    infos[i]['terminal_share_observation'] = terminal_obs.reshape(-1).copy()
+                obs[i] = self.envs[i].reset()
 
         self.actions = None
         return obs, rews, dones, infos

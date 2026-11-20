@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +23,12 @@ from backend.schemas import (
     ExperimentListResponse,
     CapabilitiesResponse,
     PresetInfo,
+    FederatedExperimentCreateRequest,
+    FederatedExperimentResponse,
+    FederatedExperimentListResponse,
+    FederatedCapabilitiesResponse,
 )
+from federated.scenarios import generate_federation_scenarios
 from moo.config import PRESETS, DEFAULT_REFERENCE_SCALES, DEFAULT_PHYSICAL_PARAMS
 from moo.pareto import find_nondominated_set, check_scenario_compatibility
 from moo.scalarization import validate_and_normalize_weights
@@ -63,6 +68,13 @@ def get_git_info() -> Dict[str, Any]:
     except Exception:
         pass
     return {"git_commit": commit, "git_dirty": dirty}
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    expected = os.getenv("API_AUTH_KEY")
+    if expected:
+        if not x_api_key or x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key header")
 
 
 @app.get("/api/health")
@@ -110,7 +122,7 @@ def get_presets():
     return result
 
 
-@app.post("/api/experiments", response_model=ExperimentResponse)
+@app.post("/api/experiments", response_model=ExperimentResponse, dependencies=[Depends(verify_api_key)])
 def create_experiment(req: ExperimentCreateRequest):
     exp_id = str(uuid.uuid4())[:8]
     
@@ -187,7 +199,7 @@ def get_experiment(exp_id: str):
     return ExperimentResponse(**exp)
 
 
-@app.post("/api/experiments/{exp_id}/cancel")
+@app.post("/api/experiments/{exp_id}/cancel", dependencies=[Depends(verify_api_key)])
 def cancel_experiment(exp_id: str):
     exp = db.get_experiment(exp_id)
     if not exp:
@@ -337,6 +349,259 @@ def get_comparisons():
         "experiments": nondominated_results,
         "nondominated_subset": [c for c in nondominated_results if c.get("is_nondominated")],
     }
+
+
+# ==========================================
+# Federated Learning API Endpoints
+# ==========================================
+
+@app.get("/api/federation/capabilities", response_model=FederatedCapabilitiesResponse)
+def get_federation_capabilities():
+    return FederatedCapabilitiesResponse(
+        supported_scenarios=[
+            "iid",
+            "task_heterogeneity",
+            "channel_heterogeneity",
+            "compute_heterogeneity",
+            "sample_budget_heterogeneity",
+            "full_heterogeneity",
+        ],
+        supported_aggregation="sample_weighted_fedavg",
+        privacy_disclaimer="Raw trajectories remain local in this simulation. Model updates may still reveal information. Differential privacy and secure aggregation are not implemented.",
+        max_clients=20,
+        max_rounds=100,
+        default_smoke_config={
+            "num_clients": 3,
+            "num_rounds": 2,
+            "scenario_type": "iid",
+            "preset_name": "balanced",
+            "min_clients": 1,
+            "participation_rate": 1.0,
+            "dropout_prob": 0.0,
+            "seed": 42,
+            "solver_name": "CLARABEL",
+            "channel_mode": "legacy",
+        },
+    )
+
+
+@app.post("/api/federated-experiments", response_model=FederatedExperimentResponse, dependencies=[Depends(verify_api_key)])
+def create_federated_experiment(req: FederatedExperimentCreateRequest):
+    exp_id = str(uuid.uuid4())[:8]
+    full_name = f"{req.name}_{exp_id}"
+    log_dir = Path("experiments_storage") / "federated_runs" / full_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    git_info = get_git_info()
+
+    # Pre-generate client scenario configurations
+    client_configs = generate_federation_scenarios(
+        num_clients=req.num_clients,
+        scenario_type=req.scenario_type,
+        base_seed=req.seed,
+        rollout_steps=200,
+    )
+
+    fed_data = {
+        "id": exp_id,
+        "name": full_name,
+        "status": "queued",
+        "preset_name": req.preset_name,
+        "scenario_type": req.scenario_type,
+        "num_clients": req.num_clients,
+        "num_rounds": req.num_rounds,
+        "current_round": 0,
+        "min_clients": req.min_clients,
+        "participation_rate": req.participation_rate,
+        "dropout_prob": req.dropout_prob,
+        "seed": req.seed,
+        "progress_percent": 0.0,
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "runtime_s": 0.0,
+        "git_commit": git_info["git_commit"],
+        "git_dirty": 1 if git_info["git_dirty"] else 0,
+        "solver_name": req.solver_name,
+        "channel_mode": req.channel_mode,
+        "config_json": json.dumps(req.model_dump()),
+        "final_metrics_json": None,
+        "communication_summary_json": None,
+        "error_message": None,
+        "log_dir": str(log_dir),
+    }
+
+    db.create_federated_experiment(fed_data)
+    db.insert_federated_clients(exp_id, [c.to_dict() for c in client_configs])
+
+    worker.enqueue(exp_id)
+
+    created = db.get_federated_experiment(exp_id)
+    return FederatedExperimentResponse(**created)
+
+
+@app.get("/api/federated-experiments", response_model=FederatedExperimentListResponse)
+def list_federated_experiments(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    total, items = db.list_federated_experiments(page=page, page_size=page_size)
+    return FederatedExperimentListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[FederatedExperimentResponse(**i) for i in items]
+    )
+
+
+@app.get("/api/federated-experiments/{exp_id}", response_model=FederatedExperimentResponse)
+def get_federated_experiment(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    return FederatedExperimentResponse(**exp)
+
+
+@app.get("/api/federated-experiments/{exp_id}/rounds")
+def get_federated_rounds(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    rounds = db.get_federated_rounds(exp_id)
+    return {"experiment_id": exp_id, "total_rounds": len(rounds), "rounds": rounds}
+
+
+@app.get("/api/federated-experiments/{exp_id}/clients")
+def get_federated_clients(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    clients = db.get_federated_clients(exp_id)
+    return {"experiment_id": exp_id, "total_clients": len(clients), "clients": clients}
+
+
+@app.get("/api/federated-experiments/{exp_id}/metrics")
+def get_federated_metrics(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    rounds = db.get_federated_rounds(exp_id)
+    return {
+        "experiment_id": exp_id,
+        "total_rounds": len(rounds),
+        "final_metrics": exp.get("final_metrics"),
+        "communication_summary": exp.get("communication_summary"),
+        "round_metrics": [
+            {
+                "round": r["round"],
+                "runtime_s": r["runtime_s"],
+                "total_valid_samples": r["total_valid_samples"],
+                "mean_delay_ms": r.get("mean_delay_ms"),
+                "mean_energy_mj": r.get("mean_energy_mj"),
+                "mean_overhead_kb": r.get("mean_overhead_kb"),
+                "mean_task_success_rate": r.get("mean_task_success_rate"),
+                "worst_task_success_rate": r.get("worst_task_success_rate"),
+                "worst_delay_ms": r.get("worst_delay_ms"),
+                "jains_fairness_index": r.get("jains_fairness_index"),
+                "eval_delay_ms": r.get("eval_delay_ms"),
+                "eval_energy_mj": r.get("eval_energy_mj"),
+                "eval_overhead_kb": r.get("eval_overhead_kb"),
+                "eval_task_success_rate": r.get("eval_task_success_rate"),
+                "eval_reward": r.get("eval_reward"),
+                "download_bytes": r.get("round_download_bytes"),
+                "upload_bytes": r.get("round_upload_bytes"),
+                "failed_bytes": r.get("round_failed_bytes"),
+            }
+            for r in rounds
+        ],
+    }
+
+
+@app.post("/api/federated-experiments/{exp_id}/cancel", dependencies=[Depends(verify_api_key)])
+def cancel_federated_experiment(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    if exp["status"] not in ["queued", "running"]:
+        return {"status": exp["status"], "message": f"Experiment is already {exp['status']}"}
+
+    worker.cancel(exp_id)
+    db.update_federated_experiment_status(exp_id, status="cancelled", finished_at=time.time())
+    return {"status": "cancelled", "message": "Federated experiment cancellation requested"}
+
+
+@app.post("/api/federated-experiments/{exp_id}/resume", dependencies=[Depends(verify_api_key)])
+def resume_federated_experiment(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+    if exp["status"] in ["running", "completed"]:
+        return {"status": exp["status"], "message": f"Experiment cannot be resumed in '{exp['status']}' state"}
+
+    db.update_federated_experiment_status(exp_id, status="queued", error_message=None)
+    worker.enqueue(exp_id)
+    return {"status": "queued", "message": "Federated experiment queued for warm resume"}
+
+
+@app.get("/api/federated-experiments/{exp_id}/artifacts")
+def list_federated_artifacts(exp_id: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+
+    artifacts = []
+    log_dir = Path(exp["log_dir"])
+    if log_dir.exists():
+        for p in log_dir.glob("*"):
+            if p.is_file():
+                artifacts.append({"name": p.name, "size_bytes": p.stat().st_size, "type": "root_artifact"})
+        checkpoints_dir = log_dir / "checkpoints"
+        if checkpoints_dir.exists():
+            for p in checkpoints_dir.glob("*"):
+                if p.is_file():
+                    artifacts.append({"name": f"checkpoints/{p.name}", "size_bytes": p.stat().st_size, "type": "checkpoint_artifact"})
+
+    return {"experiment_id": exp_id, "artifacts": artifacts}
+
+
+@app.get("/api/federated-experiments/{exp_id}/artifacts/{subpath:path}")
+def download_federated_artifact(exp_id: str, subpath: str):
+    exp = db.get_federated_experiment(exp_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Federated experiment not found")
+
+    log_dir = Path(exp["log_dir"]).resolve()
+    target = (log_dir / subpath).resolve()
+
+    # Path traversal protection
+    if not str(target).startswith(str(log_dir)):
+        raise HTTPException(status_code=400, detail="Invalid path or directory traversal detected")
+
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+
+    return FileResponse(path=str(target), filename=target.name)
+
+
+@app.get("/api/federated-comparisons")
+def get_federated_comparisons():
+    """Returns comparative summary data across Local-Only, Federated, and Pooled references."""
+    # Look for any comparative study artifacts
+    studies = []
+    base_dir = Path("experiments_storage") / "federated_runs"
+    if base_dir.exists():
+        for f in base_dir.rglob("comparative_study.json"):
+            try:
+                with open(f, "r", encoding="utf-8") as jf:
+                    studies.append(json.load(jf))
+            except Exception:
+                pass
+
+    return {
+        "total_studies": len(studies),
+        "studies": studies,
+    }
+
 
 
 # Mount built frontend if available

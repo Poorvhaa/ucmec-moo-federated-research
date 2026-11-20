@@ -47,20 +47,42 @@ def evaluate_policy_on_scenario(
     env.seed(seed)
     obs = env.reset()
 
-    # Load actor policies if model directory provided
+    # Load actor policies if model directory or file provided
     actors = []
-    if model_dir and Path(model_dir).exists():
-        from algorithms.algorithm.r_actor_critic import R_Actor
-        from config import get_config
-        parser = get_config()
-        all_args = parser.parse_known_args([])[0]
-        for a_idx in range(num_agents):
-            actor_path = Path(model_dir) / f"actor_agent{a_idx}.pt"
-            if actor_path.exists():
+    if model_dir:
+        m_path = Path(model_dir)
+        if m_path.is_file() and m_path.suffix == ".pt":
+            from algorithms.algorithm.r_actor_critic import R_Actor
+            from config import get_config
+            parser = get_config()
+            all_args = parser.parse_known_args([])[0]
+            st = torch.load(str(m_path), map_location="cpu")
+            for a_idx in range(num_agents):
                 actor = R_Actor(all_args, env.observation_space[a_idx], env.action_space[a_idx])
-                actor.load_state_dict(torch.load(str(actor_path), map_location="cpu"))
+                actor.load_state_dict(st)
                 actor.eval()
                 actors.append(actor)
+        elif m_path.is_dir():
+            from algorithms.algorithm.r_actor_critic import R_Actor
+            from config import get_config
+            parser = get_config()
+            all_args = parser.parse_known_args([])[0]
+            shared_actor = m_path / "actor.pt"
+            if shared_actor.exists():
+                st = torch.load(str(shared_actor), map_location="cpu")
+                for a_idx in range(num_agents):
+                    actor = R_Actor(all_args, env.observation_space[a_idx], env.action_space[a_idx])
+                    actor.load_state_dict(st)
+                    actor.eval()
+                    actors.append(actor)
+            else:
+                for a_idx in range(num_agents):
+                    actor_path = m_path / f"actor_agent{a_idx}.pt"
+                    if actor_path.exists():
+                        actor = R_Actor(all_args, env.observation_space[a_idx], env.action_space[a_idx])
+                        actor.load_state_dict(torch.load(str(actor_path), map_location="cpu"))
+                        actor.eval()
+                        actors.append(actor)
 
     step_delays = []
     step_energies = []
@@ -78,7 +100,7 @@ def evaluate_policy_on_scenario(
         if len(actors) == num_agents:
             with torch.no_grad():
                 for a_idx in range(num_agents):
-                    act_out, rnn_out = actors[a_idx](
+                    act_out, _, rnn_out = actors[a_idx](
                         torch.from_numpy(obs[a_idx : a_idx + 1]).float(),
                         torch.from_numpy(rnn_states[a_idx : a_idx + 1]).float(),
                         torch.from_numpy(masks[a_idx : a_idx + 1]).float(),
@@ -289,7 +311,28 @@ def main():
     parser.add_argument("--num_steps", type=int, default=200, help="Steps per evaluation episode")
     parser.add_argument("--num_agents", type=int, default=10, help="Number of agents")
     parser.add_argument("--output_dir", type=str, default="experiments_storage/evaluations")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint (.pt) or model directory")
+    parser.add_argument("--preset", type=str, default="balanced", help="Preset to use when evaluating a single checkpoint")
+    parser.add_argument("--solver_name", type=str, default="CLARABEL", help="Conic solver name")
     args = parser.parse_args()
+
+    if args.checkpoint:
+        print(f"============================================================")
+        print(f" Single Policy Evaluation: {args.checkpoint}")
+        print(f" Seeds: {args.seeds} | Preset: {args.preset} | Steps: {args.num_steps}")
+        print(f"============================================================")
+        for s in args.seeds:
+            res = evaluate_policy_on_scenario(
+                preset_name=args.preset,
+                seed=s,
+                num_steps=args.num_steps,
+                num_agents=args.num_agents,
+                model_dir=args.checkpoint,
+                solver_name=args.solver_name,
+            )
+            print(f"Seed {s:4d} | Delay: {res['delay_ms']:6.2f} ms | Energy: {res['energy_mj']:6.2f} mJ | Overhead: {res['overhead_kb']:6.3f} kB | Success: {res['task_success_rate']*100:5.1f}% | Steps: {res['num_steps_completed']}")
+        print(f"============================================================\n")
+        return
 
     run_evaluation_suite(
         presets=args.presets,

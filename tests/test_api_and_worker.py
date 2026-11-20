@@ -56,6 +56,8 @@ def test_experiment_creation_validation(client):
     assert exp["status"] == "queued"
     assert exp["preset_name"] == "balanced"
     assert exp["num_agents"] == 10
+    # Clean up so the background queue is not clogged
+    client.post(f"/api/experiments/{exp['id']}/cancel")
 
     # Invalid name (contains forbidden characters)
     bad_payload = {**payload, "name": "bad;name/rm -rf"}
@@ -89,6 +91,8 @@ def test_artifact_path_traversal_safety(client):
 
     res_escape2 = client.get(f"/api/experiments/{exp_id}/artifacts/..%2f..%2fconfig.py")
     assert res_escape2.status_code in [404, 400]
+    # Clean up so the background queue is not clogged
+    client.post(f"/api/experiments/{exp_id}/cancel")
 
 
 def test_comparisons_endpoint(client):
@@ -97,3 +101,25 @@ def test_comparisons_endpoint(client):
     data = res.json()
     assert "total_compared" in data
     assert "nondominated_subset" in data
+
+
+def test_api_auth_protection(client, monkeypatch):
+    """Verifies that API_AUTH_KEY enforces 401 on mutations when configured."""
+    monkeypatch.setenv("API_AUTH_KEY", "secret_token_123")
+    payload = {
+        "name": "auth_test",
+        "algorithm_name": "mappo",
+        "preset_name": "balanced",
+        "num_agents": 10,
+        "num_env_steps": 200,
+        "episode_length": 200,
+        "seed": 42
+    }
+    # Unauthenticated request -> 401
+    res = client.post("/api/experiments", json=payload)
+    assert res.status_code == 401
+
+    # Authenticated request -> 200
+    res_auth = client.post("/api/experiments", json=payload, headers={"X-API-Key": "secret_token_123"})
+    assert res_auth.status_code == 200
+    client.post(f"/api/experiments/{res_auth.json()['id']}/cancel", headers={"X-API-Key": "secret_token_123"})

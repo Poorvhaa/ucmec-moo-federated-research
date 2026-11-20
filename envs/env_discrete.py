@@ -115,8 +115,6 @@ class DiscreteActionEnv(object):
         pass
 
     def seed(self, seed=None):
-        if seed is not None:
-            np.random.seed(seed)
         return self.env.seed(seed)
 
 

@@ -14,6 +14,14 @@ services:
       - PORT=8000
       - WORKER_CONCURRENCY=1
       - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
     volumes:
       - experiments_data:/app/experiments_storage
       - results_data:/app/results

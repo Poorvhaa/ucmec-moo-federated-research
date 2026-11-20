@@ -221,13 +221,22 @@ class EnvRunner(Runner):
         )
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         bad_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        terminal_values = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        has_terminal_values = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=bool)
+
         for t in range(self.n_rollout_threads):
             for a in range(self.num_agents):
                 is_truncated = False
+                terminal_share_obs = None
                 if len(infos) > t and len(infos[t]) > a:
                     info_a = infos[t][a]
-                    if isinstance(info_a, dict) and (info_a.get("bad_transition", False) or info_a.get("TimeLimit.truncated", False)):
-                        is_truncated = True
+                    if isinstance(info_a, dict):
+                        if info_a.get("bad_transition", False) or info_a.get("TimeLimit.truncated", False):
+                            is_truncated = True
+                        if "terminal_share_observation" in info_a:
+                            terminal_share_obs = info_a["terminal_share_observation"]
+                        elif "terminal_observation" in info_a and not self.use_centralized_V:
+                            terminal_share_obs = info_a["terminal_observation"]
 
                 if dones[t, a]:
                     if is_truncated:
@@ -236,6 +245,14 @@ class EnvRunner(Runner):
                         if getattr(self.all_args, "use_proper_time_limits", False):
                             # Preserve value bootstrapping across the time limit boundary
                             masks[t, a] = 1.0
+                            if terminal_share_obs is not None:
+                                with torch.no_grad():
+                                    t_share_input = np.array([terminal_share_obs], dtype=np.float32)
+                                    t_rnn = np.concatenate(rnn_states_critic)[t * self.num_agents + a : t * self.num_agents + a + 1]
+                                    t_mask = np.ones((1, 1), dtype=np.float32)
+                                    t_val = self.trainer.policy.get_values(t_share_input, t_rnn, t_mask)
+                                    terminal_values[t, a] = _t2n(t_val)[0]
+                                    has_terminal_values[t, a] = True
                         else:
                             masks[t, a] = 0.0
                     else:
@@ -259,6 +276,8 @@ class EnvRunner(Runner):
             rewards,
             masks,
             bad_masks=bad_masks,
+            terminal_value_preds=terminal_values,
+            has_terminal_value=has_terminal_values,
         )
 
     @torch.no_grad()

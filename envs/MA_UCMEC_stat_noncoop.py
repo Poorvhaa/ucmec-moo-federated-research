@@ -4,7 +4,7 @@ from gym.utils import seeding
 import numpy as np
 import math
 import cvxpy as cp
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from moo.config import PRESETS, DEFAULT_PHYSICAL_PARAMS, DEFAULT_REFERENCE_SCALES
 from moo.metrics import MetricContract, StepMetricSnapshot
@@ -24,11 +24,18 @@ class MA_UCMEC_stat_noncoop(object):
         max_steps: int = 200,
         solver_name: str = "CLARABEL",
         failure_dump_dir: Optional[str] = "experiments_storage/solver_failures",
+        task_size_range: Optional[Tuple[float, float]] = None,
+        c_edge_range: Optional[Tuple[float, float]] = None,
+        epsilon: Optional[float] = None,
+        seed: Optional[int] = None,
     ):
         # Initialization
         self.is_mobile = False
         gym.logger.set_level(40)
-        np.random.seed(37)
+        if seed is not None:
+            self.np_random = np.random.RandomState(seed)
+        else:
+            self.np_random = np.random.RandomState(37)
         self.max_steps = max_steps
         self.solver_name = solver_name
         self.preset_name = preset_name
@@ -61,8 +68,8 @@ class MA_UCMEC_stat_noncoop(object):
         self.N_sim = 50  # number of APs for simulation
 
         # locations of users and APs
-        self.locations_users = np.random.random_sample([self.M, 2]) * 900  # 2-D location of users
-        self.locations_aps = np.random.random_sample([self.N, 2]) * 900  # 2-D location of APs
+        self.locations_users = self.np_random.random_sample([self.M, 2]) * 900  # 2-D location of users
+        self.locations_aps = self.np_random.random_sample([self.N, 2]) * 900  # 2-D location of APs
 
         # location of 3 CPUs
         self.locations_cpu = np.zeros([3, 2])
@@ -91,21 +98,23 @@ class MA_UCMEC_stat_noncoop(object):
 
         # edge computing parameter
         # user parameter
-        self.C_user = np.random.uniform(2e8, 5e8, [1, self.M])  # computing resource of users  in Hz
-        self.Task_size = np.random.uniform(50000, 100000, [1, self.M])  # task size in bit
-        self.Task_density = np.random.uniform(500, 1000, [1, self.M])  # task density cpu cycles per bit
+        t_low, t_high = task_size_range if task_size_range is not None else (50000.0, 100000.0)
+        c_low, c_high = c_edge_range if c_edge_range is not None else (10e9, 20e9)
+        self.C_user = self.np_random.uniform(2e8, 5e8, [1, self.M])  # computing resource of users  in Hz
+        self.Task_size = self.np_random.uniform(t_low, t_high, [1, self.M])  # task size in bit
+        self.Task_density = self.np_random.uniform(500, 1000, [1, self.M])  # task density cpu cycles per bit
         # Task_max_delay = np.random.uniform(2, 5, [1, M])  # task max delay in second
         self.cluster_size = 1 # AP cluster size
 
         # edge server parameter
-        self.C_edge = np.random.uniform(10e9, 20e9, [self.K, 1])  # computing resource of edge server in CPU
+        self.C_edge = self.np_random.uniform(c_low, c_high, [self.K, 1])  # computing resource of edge server in CPU
 
         # access channel
         self.tau_c = 0.1  # coherence time = 100ms
         self.access_chan = np.zeros([self.M, self.N, self.varsig], dtype=complex)  # complex channel
         self.bandwidth_a = 2e6  # bandwidth of access channel
-        self.kappa_1 = np.random.rand(1, self.N)  # parameter in Eq. (5)
-        self.kappa_2 = np.random.rand(1, self.M)  # parameter in Eq. (5)
+        self.kappa_1 = self.np_random.rand(1, self.N)  # parameter in Eq. (5)
+        self.kappa_2 = self.np_random.rand(1, self.M)  # parameter in Eq. (5)
         self.f_carrier = 1.9e9  # carrier frequency in Hz
         self.h_ap = 15  # antenna height of AP
         self.h_user = 1.65  # antenna height of user
@@ -141,13 +150,13 @@ class MA_UCMEC_stat_noncoop(object):
                 # Eq. (2) channel computation
                 self.beta[i, j] = pow(10, self.PL[i, j] / 10) * pow(10, (self.sigma_s * self.mu[i, j]) / 10)
                 for k in range(self.varsig):
-                    self.h[i, j, k] = np.random.normal(loc=0, scale=0.5) + 1j * np.random.normal(loc=0, scale=0.5)
+                    self.h[i, j, k] = self.np_random.normal(loc=0, scale=0.5) + 1j * self.np_random.normal(loc=0, scale=0.5)
                     self.access_chan[i, j, k] = np.sqrt(self.beta[i, j]) * self.h[i, j, k]
 
         # fronthaul channel
         # front_chan = np.zeros([N, K])
         self.bandwidth_f = 2e9  # bandwidth of fronthaul channel
-        self.epsilon = 6e-4  # blockage density
+        self.epsilon = epsilon if epsilon is not None else 6e-4  # blockage density
         self.p_ap = 1  # transmit power of APs (30 dBm = 1 W)
         self.alpha_los = 2.5  # path-loss exponent for LOS links
         self.alpha_nlos = 4  # path-loss exponent for NLOS links
@@ -169,13 +178,13 @@ class MA_UCMEC_stat_noncoop(object):
         for i in range(self.N):
             for j in range(self.K):
                 self.P_los[i, j] = np.exp(-self.epsilon * self.distance_matrix_front[i, j] / 1000)
-                self.link_type[i, j] = np.random.choice([0, 1], p=[self.P_los[i, j],
+                self.link_type[i, j] = self.np_random.choice([0, 1], p=[self.P_los[i, j],
                                                                    1 - self.P_los[i, j]])  # 0 for LOS, 1 for NLOS
                 # if link_type[i, j] == 0:  # LOS link
                 #     front_chan[i, j] = np.random.gamma(2, 1 / psi_los)  # Nakagami channel gain
                 # else:  # NLOS link
                 #     front_chan[i, j] = np.random.gamma(2, 1 / psi_nlos)  # Nakagami channel gain
-                self.G[i, j] = np.random.choice(self.Gain, p=self.Gain_pro.ravel())
+                self.G[i, j] = self.np_random.choice(self.Gain, p=self.Gain_pro.ravel())
         # pilot assignment
         self.tau_p = self.M  # length of pilot symbol
         self.pilot_matrix = np.zeros([self.M, self.tau_p])
@@ -351,8 +360,7 @@ class MA_UCMEC_stat_noncoop(object):
 
     def seed(self, seed=None):
         if seed is not None:
-            np.random.seed(seed)
-        self.np_random, seed = gym.utils.seeding.np_random(seed)
+            self.np_random = np.random.RandomState(seed)
         return [seed]
 
     def render(self, mode='human'):
@@ -365,7 +373,7 @@ class MA_UCMEC_stat_noncoop(object):
         self.delay_last.fill(0)
         sub_agent_obs = []
         for i in range(self.agent_num):
-            sub_obs = np.random.uniform(low=self.obs_low, high=self.obs_high, size=(self.obs_dim,))
+            sub_obs = self.np_random.uniform(low=self.obs_low, high=self.obs_high, size=(self.obs_dim,))
             sub_agent_obs.append(sub_obs)
         return sub_agent_obs
 
